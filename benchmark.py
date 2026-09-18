@@ -477,8 +477,10 @@ def readable(ns):
     return f'{ns:.2f} ns'
 
 
-def measure(executable, args, cwd, record, timeout):
+def measure(executable, args, cwd, record, timeout, extra_env=None):
     env = dict(os.environ, MAIN_BENCH_RESULT=str(record))
+    if extra_env:
+        env.update(extra_env)
     start = time.perf_counter_ns()
     try:
         process = subprocess.run([str(executable)] + args, cwd=cwd, env=env,
@@ -614,8 +616,12 @@ def prepare_adb(options):
     return adb, serial, cmake_args, metadata
 
 
-def measure_adb(adb, serial, remote_executable, args, remote_record, timeout):
-    remote_parts = [f'MAIN_BENCH_RESULT={remote_record}', remote_executable] + args
+def measure_adb(adb, serial, remote_executable, args, remote_record, timeout, extra_env=None):
+    remote_parts = [f'MAIN_BENCH_RESULT={remote_record}']
+    if extra_env:
+        for k, v in extra_env.items():
+            remote_parts.append(f'{k}={v}')
+    remote_parts += [remote_executable] + args
     remote_command = 'cd /data/local/tmp && ' + shlex.join(remote_parts)
     start = time.perf_counter_ns()
     try:
@@ -737,7 +743,8 @@ def validate_extra(extra):
 def run():
     run_started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('project', type=Path)
+    parser.add_argument('project', nargs='?', default=Path('.'), type=Path)
+    parser.add_argument('--gui', action='store_true', help='launch the PyQt5 Dashboard GUI')
     parser.add_argument('--target')
     parser.add_argument('--compare', help='second executable target in the same project')
     parser.add_argument('--runs', type=int, help='fixed measured runs; default: adaptive sampling')
@@ -765,6 +772,10 @@ def run():
     argv = sys.argv[1:]
     split = argv.index('--') if '--' in argv else len(argv)
     options = parser.parse_args(argv[:split])
+    if options.gui:
+        from dashboard_gui import main as gui_main
+        sys.argv = [sys.argv[0], str(options.project.resolve())]
+        return gui_main() or 0
     console = Console(options.color)
     program_args = argv[split + 1:]
     if ((options.runs is not None and options.runs < 1) or options.warmup < 0 or

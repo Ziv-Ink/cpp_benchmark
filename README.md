@@ -2,7 +2,17 @@
 
 Benchmarks an executable target from an existing CMake project without editing the original source. The tool copies the project to a temporary directory, instruments `main()`, builds the selected target in Release mode through CMake, and reports repeated `std::chrono::steady_clock` measurements.
 
-## Local
+## Desktop GUI Dashboard
+
+Launch the PyQt5 dashboard studio with interactive flame graphs, per-function breakdown, syscall attribution, sample distribution charts, and run comparisons:
+
+```sh
+python3 gui.py
+# or
+python3 benchmark.py --gui
+```
+
+## Local CLI
 
 ```sh
 python3 benchmark.py /path/to/project --target app
