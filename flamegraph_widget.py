@@ -73,7 +73,7 @@ class FlameGraphWidget(QtWidgets.QWidget):
         self.hovered_node: Optional[FlameNode] = None
         self.selected_node: Optional[FlameNode] = None
 
-        self.row_height: int = 24
+        self.row_height: int = 28
         self.max_depth: int = 0
         self.top_down: bool = True  # Icicle style (default) vs flame bottom-up
         self.color_mode: str = "heat"  # "heat", "hash", "depth"
@@ -155,6 +155,7 @@ class FlameGraphWidget(QtWidgets.QWidget):
 
     def reset_zoom(self):
         self.current_zoom_node = self.root_node
+        self.selected_node = None  # Bug 18: clear ghost selection highlight
         self.zoom_changed.emit(self.current_zoom_node)
         self.update()
 
@@ -177,8 +178,12 @@ class FlameGraphWidget(QtWidgets.QWidget):
 
     def get_breadcrumbs(self) -> List[Tuple[str, FlameNode]]:
         """Returns the ancestor path for breadcrumb navigation."""
+        return self.get_node_path(self.current_zoom_node)
+
+    def get_node_path(self, node: Optional[FlameNode]) -> List[Tuple[str, FlameNode]]:
+        """Returns the ancestor path for any given node."""
         crumbs: List[Tuple[str, FlameNode]] = []
-        cur = self.current_zoom_node
+        cur = node
         while cur:
             crumbs.append((cur.name or "root", cur))
             cur = cur.parent
@@ -254,7 +259,7 @@ class FlameGraphWidget(QtWidgets.QWidget):
 
         if not self.root_node or not self.current_zoom_node:
             painter.setPen(QtGui.QColor("#6c7280"))
-            painter.setFont(QtGui.QFont("Segoe UI", 11))
+            painter.setFont(QtGui.QFont("-apple-system", 13))
             painter.drawText(
                 rect,
                 Qt.AlignCenter,
@@ -322,7 +327,8 @@ class FlameGraphWidget(QtWidgets.QWidget):
                 else QtGui.QColor("#f3f4f6")
             )
 
-            font = QtGui.QFont("Segoe UI", 9, QtGui.QFont.Medium)
+            font = QtGui.QFont("-apple-system", 10, QtGui.QFont.Medium)
+            font.setStyleHint(QtGui.QFont.SansSerif)
             painter.setFont(font)
 
             label = node.name
@@ -416,11 +422,11 @@ class FlameGraphWidget(QtWidgets.QWidget):
                 self.zoom_to_node(self.current_zoom_node.parent)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent):
-        """Double-click zooms into the clicked node."""
+        """Double-click zooms into the clicked node (only if it has children)."""
         if event.button() == Qt.LeftButton:
             pos = QPointF(event.pos())
             node = self._find_node_at(pos, self.current_zoom_node)
-            if node:
+            if node and node.children:  # Bug 16: don't zoom into leaf nodes
                 self.zoom_to_node(node)
 
     def _show_tooltip(self, global_pos: QtCore.QPoint, node: FlameNode):
@@ -442,21 +448,21 @@ class FlameGraphWidget(QtWidgets.QWidget):
         )
         avg_ns = (node.total_ns / node.calls) if node.calls > 0 else 0
 
-        syscall_info = ""
+        sc_html = ""
         if node.syscalls:
             sc_items = ", ".join(
                 f"{k}: {v}" for k, v in list(node.syscalls.items())[:4]
             )
-            syscall_info = f"<br><b>Syscalls:</b> {sc_items}"
+            sc_html = f"<b>Syscalls:</b> {sc_items}<br>"
 
         text = f"""
-        <div style="font-family: Segoe UI, sans-serif; font-size: 12px; color: #f3f4f6; background-color: #1f242d; padding: 6px; border: 1px solid #374151; border-radius: 6px;">
-          <b style="font-size: 13px; color: #60a5fa;">{node.name}</b><br>
+        <div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; font-size: 13px; color: #f3f4f6; background-color: #1f242d; padding: 8px; border: 1px solid #374151; border-radius: 6px;">
+          <b style="font-size: 14px; color: #60a5fa;">{node.name}</b><br>
           <b>Inclusive:</b> {format_duration(node.total_ns)} ({total_pct:.1f}% total, {parent_pct:.1f}% parent)<br>
-          <b>Self Time:</b> {format_duration(node.self_ns)} ({self_pct:.1f}% self)<br>
-          <b>Calls:</b> {node.calls:,} (avg {format_duration(avg_ns)})
-          {syscall_info}
-          <div style="font-size: 10px; color: #9ca3af; margin-top: 4px;">Click to select • Double-click to zoom in • Right-click to zoom out</div>
+          <b>Self:</b> {format_duration(node.self_ns)} ({self_pct:.1f}% self)<br>
+          <b>Calls:</b> {node.calls:,} (avg {format_duration(avg_ns)})<br>
+          {sc_html}
+          <div style="font-size: 11px; color: #9ca3af; margin-top: 6px;">Click to select • {'Double-click to zoom in' if node.children else 'Leaf node (no children)'} • Right-click to zoom out</div>
         </div>
         """
         QtWidgets.QToolTip.showText(global_pos, text, self)

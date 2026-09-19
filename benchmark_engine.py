@@ -33,6 +33,12 @@ import benchmark as base_bench
 from syscall_tracer import SyscallTracer
 
 
+# Updating a visible Qt widget during a fresh-process sweep lets the GUI event
+# loop compete with the next benchmark process.  One full adaptive sweep is at
+# most 200 samples, so defer those updates until the sweep completes.
+SAMPLE_UPDATE_BATCH = 200
+
+
 def format_ns(ns: int | float) -> str:
     if ns is None or math.isnan(ns) or ns < 0:
         return "0 ns"
@@ -45,13 +51,45 @@ def format_ns(ns: int | float) -> str:
     return f"{ns / 1_000_000_000:.3f} s"
 
 
+PROFILE_DURATION_FIELDS = ("total_ns", "self_ns", "min_ns", "max_ns")
+
+
+def normalize_profile_durations(profile: Dict[str, Any], measured_ns: int | float) -> bool:
+    """Scale every displayed profiler duration to the measured median.
+
+    Function profiling is collected in a separate, instrumented process.  It
+    preserves call proportions, but its absolute timings include instrumentation
+    overhead.  Keeping every duration field on the same scale avoids presenting
+    an impossible combination such as a max call longer than its total time.
+    """
+    functions = profile.get("functions", [])
+    profiled_ns = max(
+        (fn.get("total_ns", 0) for fn in functions), default=0
+    )
+    if profiled_ns <= 0 or measured_ns <= 0:
+        return False
+
+    factor = float(measured_ns) / float(profiled_ns)
+    for collection in (functions, profile.get("tree", [])):
+        for entry in collection:
+            for field in PROFILE_DURATION_FIELDS:
+                value = entry.get(field)
+                if isinstance(value, (int, float)) and value >= 0:
+                    entry[field] = int(round(value * factor))
+
+    profile["total_duration_ns"] = int(round(measured_ns))
+    profile["timing_basis"] = "normalized_profile_estimate"
+    return True
+
+
 def clean_cpp_name(name: str) -> str:
     """Simplifies verbose C++ demangled names for better readability."""
     if not name:
         return name
     # Strip return types from the beginning (e.g. "char8_t* ", "void ")
-    # Actually, just strip everything before the first namespace or class if it ends in space/pointer
-    name = re.sub(r'^[\w\s\*&_]+?\s+([A-Za-z_])', r'\1', name)
+    # Keep 'operator ...' intact
+    if not name.startswith("operator"):
+        name = re.sub(r'^[\w\s\*&_]+?\s+([A-Za-z_])', r'\1', name)
     
     # Remove ABI tags
     name = re.sub(r'\[abi:[^\]]+\]', '', name)
@@ -145,6 +183,7 @@ class BenchmarkWorker(QtCore.QThread):
     sig_status = QtCore.pyqtSignal(str)
     sig_stage = QtCore.pyqtSignal(str, int, int)
     sig_sample = QtCore.pyqtSignal(dict)
+    sig_samples = QtCore.pyqtSignal(list)
     sig_stability = QtCore.pyqtSignal(dict)
     sig_finished = QtCore.pyqtSignal(dict)
     sig_error = QtCore.pyqtSignal(str)
@@ -167,6 +206,7 @@ class BenchmarkWorker(QtCore.QThread):
         try:
             import copy
             if self.config.run_mode == "combined":
+                combined_start = time.monotonic()
                 self.sig_log.emit("=== COMBINED MODE: PASS 1 (ACCURATE TIMING) ===")
                 cfg_time = copy.deepcopy(self.config)
                 cfg_time.profile_functions = False
@@ -187,8 +227,23 @@ class BenchmarkWorker(QtCore.QThread):
                     self.sig_cancelled.emit()
                     return
 
+                # Keep the profile's entire duration vocabulary on the same
+                # scale as the independently measured median.
+                try:
+                    true_time_ns = report_time["targets"][self.config.target]["summary"].get("median_ns", 0)
+                    prof_data = report_prof.get("profile", {})
+                    if normalize_profile_durations(prof_data, true_time_ns):
+                        self.sig_log.emit(f"[OK] Normalized profile times to match true median ({true_time_ns / 1000.0:.2f} µs)")
+                    else:
+                        self.sig_log.emit("[WARN] Profile did not contain a positive duration to normalize.")
+                except Exception as e:
+                    self.sig_log.emit(f"[WARN] Could not normalize profile times: {e}")
+
                 report_time["profile"] = report_prof.get("profile", {})
                 report_time["syscalls"] = report_prof.get("syscalls", {})
+                report_time["timings"]["profile_pass_seconds"] = report_prof.get("timings", {}).get("total_seconds", 0.0)
+                report_time["timings"]["total_seconds"] = time.monotonic() - combined_start
+                report_time["profile_timing_basis"] = "normalized estimate from one instrumented profile pass"
                 self.sig_finished.emit(report_time)
 
             elif self.config.run_mode == "time":
@@ -252,7 +307,7 @@ class BenchmarkWorker(QtCore.QThread):
             if cfg.adb:
                 if not serial:
                     serial = base_bench.select_adb_device(
-                        adb, base_bench.Console()
+                        adb, None
                     )
                 ndk_root, toolchain = base_bench.find_ndk(
                     cfg.ndk or os.environ.get("ANDROID_NDK_HOME")
@@ -388,6 +443,30 @@ endif()
             profile_data: Dict[str, Any] = {}
             profile_json_paths = {n: root / f"profile_{n}.json" for n in names}
             profile_captured = {n: False for n in names}
+            pending_samples: List[Dict[str, Any]] = []
+            pending_status: Optional[str] = None
+            pending_stability: Optional[Dict[str, Any]] = None
+
+            def flush_live_updates() -> None:
+                """Send one queued UI update for a group of completed processes."""
+                nonlocal pending_samples, pending_status, pending_stability
+                if pending_status is not None:
+                    self.sig_status.emit(pending_status)
+                    pending_status = None
+                if pending_samples:
+                    self.sig_samples.emit(pending_samples)
+                    pending_samples = []
+                if pending_stability is not None:
+                    self.sig_stability.emit(pending_stability)
+                    pending_stability = None
+
+            def queue_live_update(status: str, sample: Dict[str, Any]) -> None:
+                """Keep UI work out of the per-process measurement cadence."""
+                nonlocal pending_status
+                pending_status = status
+                pending_samples.append(sample)
+                if len(pending_samples) >= SAMPLE_UPDATE_BATCH:
+                    flush_live_updates()
 
             # Execute runs — deploy to ADB device if in ADB mode
             remote_root = None
@@ -404,16 +483,14 @@ endif()
 
             cwd = cfg.project_dir
             try:
-                for name in names:
-                    exe = executables[name]
-
-                    # 1. Warmups
-                    for w in range(cfg.warmup):
-                        if self._is_cancelled:
-                            return {}
-                        self.sig_status.emit(
-                            f"Warmup {w+1}/{cfg.warmup} for {name}..."
-                        )
+                # 1. Warmups (alternating order when comparing multiple targets)
+                for w in range(cfg.warmup):
+                    if self._is_cancelled:
+                        return {}
+                    active_names = names if w % 2 == 0 else list(reversed(names))
+                    for name in active_names:
+                        exe = executables[name]
+                        status = f"Warmup {w+1}/{cfg.warmup} for {name}..."
                         if cfg.adb:
                             remote_rec = f"{remote_root}/warmup-{name}-{w}.txt"
                             res = base_bench.measure_adb(
@@ -425,39 +502,41 @@ endif()
                                 exe, cfg.program_args, cwd, record, cfg.timeout
                             )
                         report_targets[name]["warmups"].append(res)
-                        self.sig_sample.emit(
+                        queue_live_update(status,
                             {
                                 "target": name,
                                 "phase": "warmup",
                                 "iteration": w + 1,
-                                "elapsed_ns": res.get("elapsed_ns", 0),
+                                "elapsed_ns": res.get("elapsed_ns") or 0,
                             }
                         )
+                        if "error" in res:
+                            raise RuntimeError(f"Warmup failed for {name}: {res['error']}")
 
-                    # 2. Measured runs
-                    consecutive_passes = 0
-                    sample_idx = 0
-                    while sample_idx < (cfg.runs or cfg.max_runs):
-                        if self._is_cancelled:
-                            return {}
-                        sample_idx += 1
+                # 2. Measured runs (alternating order each round for fair sampling)
+                max_limit = cfg.runs or cfg.max_runs
+                round_idx = 0
+                consecutive_passes = 0
+                while round_idx < max_limit:
+                    if self._is_cancelled:
+                        return {}
+                    round_idx += 1
+                    active_names = names if (round_idx - 1) % 2 == 0 else list(reversed(names))
+                    for name in active_names:
+                        exe = executables[name]
                         if cfg.runs is None:
-                            self.sig_status.emit(
-                                f"Run {sample_idx} (adaptive, min {cfg.min_runs}) for {name}..."
-                            )
+                            status = f"Run {round_idx} (adaptive, min {cfg.min_runs}) for {name}..."
                         else:
-                            self.sig_status.emit(
-                                f"Run {sample_idx}/{cfg.runs} for {name}..."
-                            )
+                            status = f"Run {round_idx}/{cfg.runs} for {name}..."
 
                         want_profile = (
                             cfg.profile_functions
-                            and sample_idx == 1
+                            and round_idx == 1
                             and not profile_captured[name]
                         )
 
                         if cfg.adb:
-                            remote_rec = f"{remote_root}/sample-{name}-{sample_idx}.txt"
+                            remote_rec = f"{remote_root}/sample-{name}-{round_idx}.txt"
                             extra_env = {}
                             if want_profile:
                                 remote_prof = f"{remote_root}/profile_{name}.json"
@@ -473,7 +552,7 @@ endif()
                                     adb, serial, "pull", remote_prof, str(profile_json_paths[name]), check=False
                                 )
                         else:
-                            record = root / f"{name}-sample-{sample_idx}.txt"
+                            record = root / f"{name}-sample-{round_idx}.txt"
                             env_override = os.environ.copy()
                             if want_profile:
                                 env_override["MAIN_BENCH_PROFILE_RESULT"] = str(
@@ -491,44 +570,50 @@ endif()
                             )
 
                         report_targets[name]["samples"].append(res)
-
-                        elapsed_ns = res.get("elapsed_ns", 0)
-                        self.sig_sample.emit(
+                        elapsed_ns = res.get("elapsed_ns") or 0
+                        queue_live_update(status,
                             {
                                 "target": name,
                                 "phase": "sample",
-                                "iteration": sample_idx,
+                                "iteration": round_idx,
                                 "elapsed_ns": elapsed_ns,
                             }
                         )
+                        if "error" in res:
+                            raise RuntimeError(f"Measured run failed for {name}: {res['error']}")
 
-                        # Check adaptive stability if adaptive mode
-                        if cfg.runs is None and sample_idx >= cfg.min_runs:
+                    # Check adaptive stability if adaptive mode (every 5 rounds, matching benchmark.py)
+                    if cfg.runs is None and round_idx >= cfg.min_runs and round_idx % 5 == 0:
+                        all_passed = True
+                        for name in names:
                             valid_vals = [
                                 s["elapsed_ns"]
                                 for s in report_targets[name]["samples"]
-                                if "error" not in s
+                                if "error" not in s and s.get("elapsed_ns") is not None
                             ]
                             stab = base_bench.stability(valid_vals, cfg.precision)
-                            self.sig_stability.emit(stab)
-                            if stab["passed"]:
-                                consecutive_passes += 1
-                                if consecutive_passes >= 3:
-                                    self.sig_log.emit(
-                                        f"[OK] Target {name} reached stability after {sample_idx} runs."
-                                    )
-                                    break
-                            else:
-                                consecutive_passes = 0
+                            if name == cfg.target:
+                                pending_stability = stab
+                            if not stab.get("passed"):
+                                all_passed = False
 
-                            if (
-                                time.monotonic() - t_stage
-                            ) > cfg.max_time:
+                        if all_passed:
+                            consecutive_passes += 1
+                            if consecutive_passes >= 3:
                                 self.sig_log.emit(
-                                    f"[INFO] Target {name} reached max time budget ({cfg.max_time}s)."
+                                    f"[OK] Targets reached stability after {round_idx} rounds."
                                 )
                                 break
+                        else:
+                            consecutive_passes = 0
+
+                        if (time.monotonic() - t_stage) > cfg.max_time:
+                            self.sig_log.emit(
+                                f"[INFO] Reached max time budget ({cfg.max_time}s)."
+                            )
+                            break
             finally:
+                flush_live_updates()
                 if cfg.adb and remote_root:
                     base_bench.adb_command(adb, serial, "shell", "rm", "-rf", remote_root, check=False)
 
@@ -572,16 +657,81 @@ endif()
             def is_noise(name: str) -> bool:
                 if not name: return True
                 if name.startswith("__"): return True
-                # Match std:: at start or preceded by non-identifier char (like &, *, space, <)
-                if re.search(r'(^|[^A-Za-z0-9_])std::', name): return True
-                if re.search(r'(^|[^A-Za-z0-9_])__gnu_cxx::', name): return True
+                # Strip trailing argument list
+                func_qual = re.sub(r'\([^\(\)]*\)\s*(?:const|noexcept|\&|\&\&)?\s*$', '', name).strip()
+                # Strip template arguments
+                cleaned = re.sub(r'<[^>]*>', '', func_qual)
+                if re.search(r'\b(?:std|__gnu_cxx|bench|__format|__formatter)\b', cleaned):
+                    return True
+                if 'bench_profile' in name:
+                    return True
                 return False
 
             profile_data["functions"] = [
                 fn for fn in profile_data.get("functions", [])
                 if not is_noise(fn.get("name", ""))
             ]
+
+            # Merge ABI-duplicate constructor/destructor entries.
+            # The Itanium C++ ABI emits two physical symbols per ctor/dtor:
+            #   C1 (complete object ctor) and C2 (base object ctor) — same demangled name.
+            # -finstrument-functions instruments both, so C2 appears nested inside C1,
+            # making it look like the constructor ran twice. Fix: keep the entry with the
+            # largest total_ns (C1, the outer wrapper) and drop the rest.
+            seen: dict = {}  # name → best entry so far
+            for fn in profile_data.get("functions", []):
+                name = fn.get("name", "")
+                if name not in seen:
+                    seen[name] = fn
+                else:
+                    existing = seen[name]
+                    # Keep the outer (larger total_ns) variant
+                    if fn.get("total_ns", 0) > existing.get("total_ns", 0):
+                        # Merge syscall data from the smaller entry if any
+                        if fn.get("syscalls") is None and existing.get("syscalls"):
+                            fn["syscalls"] = existing["syscalls"]
+                        seen[name] = fn
+                    # else: existing is already the larger; merge syscalls if needed
+                    elif existing.get("syscalls") is None and fn.get("syscalls"):
+                        existing["syscalls"] = fn["syscalls"]
+            profile_data["functions"] = list(seen.values())
             
+            # Filter zero-call harness nodes from the flame graph tree
+            if profile_data.get("tree"):
+                profile_data["tree"] = [
+                    node for node in profile_data["tree"]
+                    if not (node.get("calls", 0) == 0 and node.get("total_ns", 0) == 0)
+                ]
+
+            # Merge ABI-duplicate sibling nodes in the call tree (same parent, same name).
+            # Group tree nodes by (parent_id, name); keep the one with the largest total_ns.
+            if profile_data.get("tree"):
+                # Build a map: (parent, name) → best node id so far
+                best: dict = {}  # (parent, name) → node dict
+                keep_ids: set = set()
+                remap: dict = {}  # dropped_id → surviving_id
+                for node in profile_data["tree"]:
+                    key = (node.get("parent", -1), node.get("name", ""))
+                    if key not in best:
+                        best[key] = node
+                        keep_ids.add(node["id"])
+                    else:
+                        existing = best[key]
+                        if node.get("total_ns", 0) > existing.get("total_ns", 0):
+                            remap[existing["id"]] = node["id"]
+                            keep_ids.discard(existing["id"])
+                            keep_ids.add(node["id"])
+                            best[key] = node
+                        else:
+                            remap[node["id"]] = existing["id"]
+                # Apply remap to parent references and filter dropped nodes
+                surviving = [n for n in profile_data["tree"] if n["id"] in keep_ids]
+                for node in surviving:
+                    p = node.get("parent")
+                    if p in remap:
+                        node["parent"] = remap[p]
+                profile_data["tree"] = surviving
+
             # Optional: Collapse noise nodes in the tree to clean up the flame graph a bit
             for node in profile_data.get("tree", []):
                 if is_noise(node.get("name", "")):
@@ -590,6 +740,7 @@ endif()
             # Syscall tracing
             syscall_data: Dict[str, Any] = {
                 "available": False,
+                "error": "Syscall tracing was disabled.",
                 "summary": {},
                 "by_function": {},
                 "total_syscalls": 0,
@@ -604,6 +755,12 @@ endif()
                     self.sig_log.emit(
                         f"[OK] Syscall trace complete: {syscall_data.get('total_syscalls', 0)} calls captured"
                     )
+                else:
+                    syscall_data["error"] = "strace is not available on this host."
+                    self.sig_log.emit("[SKIP] Syscall tracing is unavailable: strace was not found on this host.")
+            elif cfg.trace_syscalls:
+                syscall_data["error"] = "Syscall tracing is not available for Android runs."
+                self.sig_log.emit("[SKIP] Syscall tracing is unavailable for Android runs.")
 
             # Link syscalls to profile functions
             by_func = syscall_data.get("by_function", {})
@@ -619,10 +776,10 @@ endif()
                 vals = [
                     s["elapsed_ns"]
                     for s in data["samples"]
-                    if "error" not in s
+                    if "error" not in s and s.get("elapsed_ns") is not None
                 ]
                 data["summary"] = base_bench.summarize(vals)
-                if len(vals) >= 2:
+                if len(vals) >= 2 and data["summary"]:
                     stab = base_bench.stability(vals, cfg.precision)
                     data["summary"][
                         "relative_standard_error_percent"
@@ -643,13 +800,17 @@ endif()
                 m1 = report_targets[cfg.target]["summary"]["median_ns"]
                 m2 = report_targets[cfg.compare_target]["summary"]["median_ns"]
                 fastest = cfg.target if m1 <= m2 else cfg.compare_target
-                ratio = (m2 / m1) if m1 > 0 else 1.0
+                slowest = cfg.compare_target if m1 <= m2 else cfg.target
+                min_m = min(m1, m2)
+                max_m = max(m1, m2)
+                ratio = (max_m / min_m) if min_m and min_m > 0 else 1.0
                 comparison = {
                     "target_a": cfg.target,
                     "target_b": cfg.compare_target,
                     "median_a_ns": m1,
                     "median_b_ns": m2,
                     "fastest": fastest,
+                    "slowest": slowest,
                     "speedup": ratio,
                 }
 
@@ -658,13 +819,24 @@ endif()
             primary_summary = (
                 report_targets.get(cfg.target, {}).get("summary") or {}
             )
+            if profile_data and "total_duration_ns" not in profile_data:
+                profile_data["total_duration_ns"] = int(primary_summary.get("median_ns", 0) or 0)
+                profile_data["timing_basis"] = "instrumented_profile_run"
+
+            primary_samples = report_targets[cfg.target]["samples"]
+            valid_samples = [
+                sample for sample in primary_samples
+                if "error" not in sample and sample.get("elapsed_ns") is not None
+            ]
 
             full_report = {
                 "project": str(cfg.project_dir),
                 "target": cfg.target,
                 "compare": cfg.compare_target,
                 "date": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "runs": len(report_targets[cfg.target]["samples"]),
+                "runs": len(valid_samples),
+                "attempted_runs": len(primary_samples),
+                "invalid_runs": len(primary_samples) - len(valid_samples),
                 "warmup_runs": len(report_targets[cfg.target]["warmups"]),
                 "summary": primary_summary,
                 "timings": timings,

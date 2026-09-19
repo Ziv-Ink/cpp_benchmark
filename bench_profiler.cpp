@@ -46,9 +46,23 @@ struct FuncStat {
     int64_t max_ns = 0;
 };
 
+struct EdgeKey {
+    uint32_t parent;
+    void* fn;
+    bool operator==(const EdgeKey& o) const noexcept {
+        return parent == o.parent && fn == o.fn;
+    }
+};
+
+struct EdgeKeyHash {
+    std::size_t operator()(const EdgeKey& k) const noexcept {
+        return std::hash<uint32_t>()(k.parent) ^ (reinterpret_cast<uintptr_t>(k.fn) >> 3);
+    }
+};
+
 static std::vector<ProfileTreeNode> g_tree;
 static std::unordered_map<void*, FuncStat> g_stats;
-static std::unordered_map<uint64_t, uint32_t> g_edge_map;
+static std::unordered_map<EdgeKey, uint32_t, EdgeKeyHash> g_edge_map;
 
 inline __attribute__((no_instrument_function)) int64_t now_ns() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -195,12 +209,12 @@ __attribute__((no_instrument_function)) bool bench_profile_is_active() noexcept 
 
 __attribute__((no_instrument_function)) void __cyg_profile_func_enter(void *this_fn, void *call_site) noexcept {
     if (!g_active || g_in_hook) return;
+    g_in_hook = true;
     int64_t hook_start = now_ns();
     (void)call_site;
-    g_in_hook = true;
 
     uint32_t parent_idx = (g_sp > 0) ? g_stack[g_sp - 1].tree_index : 0;
-    uint64_t edge_key = (static_cast<uint64_t>(parent_idx) << 32) ^ reinterpret_cast<uintptr_t>(this_fn);
+    EdgeKey edge_key{parent_idx, this_fn};
     auto it = g_edge_map.find(edge_key);
     uint32_t node_idx = 0;
     if (it != g_edge_map.end()) {
@@ -224,9 +238,9 @@ __attribute__((no_instrument_function)) void __cyg_profile_func_enter(void *this
 
 __attribute__((no_instrument_function)) void __cyg_profile_func_exit(void *this_fn, void *call_site) noexcept {
     if (!g_active || g_in_hook) return;
+    g_in_hook = true;
     int64_t hook_start = now_ns();
     (void)call_site;
-    g_in_hook = true;
 
     if (g_sp > 0) {
         StackFrame frame = g_stack[--g_sp];

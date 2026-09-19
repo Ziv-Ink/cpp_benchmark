@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Dict, Any, List
 
 
 def format_duration(ns: int | float) -> str:
-    if ns is None or ns < 0:
+    if ns is None or (isinstance(ns, float) and (math.isnan(ns) or math.isinf(ns))) or ns < 0:
         return "0 ns"
     if ns < 1_000:
         return f"{ns:.0f} ns"
@@ -117,8 +118,10 @@ def export_html_report(data: Dict[str, Any], filepath: Path | str) -> Path:
     mean_str = format_duration(summary.get("mean_ns", 0))
     min_str = format_duration(summary.get("min_ns", 0))
     max_str = format_duration(summary.get("max_ns", 0))
-    rse_str = f"{summary.get('relative_standard_error_percent', 0):.2f}%"
-    drift_str = f"{summary.get('median_drift_percent', 0):.2f}%"
+    rse = summary.get("relative_standard_error_percent")
+    drift = summary.get("median_drift_percent")
+    rse_str = f"{rse:.2f}%" if rse is not None else "N/A"
+    drift_str = f"{drift:.2f}%" if drift is not None else "N/A"
     runs_count = summary.get("runs", data.get("runs", 0))
 
     html_content = f"""<!DOCTYPE html>
