@@ -241,6 +241,24 @@ class NumericTableWidgetItem(QtWidgets.QTableWidgetItem):
         return super().__lt__(other)
 
 
+class NumericTreeWidgetItem(QtWidgets.QTreeWidgetItem):
+    """QTreeWidgetItem that sorts numerically when UserRole data is present."""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        if not tree:
+            return super().__lt__(other)
+        col = tree.sortColumn()
+        val_self = self.data(col, Qt.UserRole)
+        val_other = other.data(col, Qt.UserRole)
+        if val_self is not None and val_other is not None:
+            try:
+                return float(val_self) < float(val_other)
+            except (ValueError, TypeError):
+                pass
+        return super().__lt__(other)
+
+
 class TimelineChartWidget(QtWidgets.QWidget):
     """Custom chart showing sample durations over iterations and warmup settling."""
 
@@ -705,7 +723,7 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
         self.lbl_profile_note.setStyleSheet("color: #94a3b8; font-size: 12px;")
         layout.addWidget(self.lbl_profile_note)
 
-        # Search bar row
+        # Search and filter controls row
         search_bar = QtWidgets.QHBoxLayout()
         self.txt_func_search = QtWidgets.QLineEdit()
         self.txt_func_search.setPlaceholderText("🔍 Filter functions by name...")
@@ -714,33 +732,66 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
         self.txt_func_search.setFixedHeight(36)
         search_bar.addWidget(self.txt_func_search, stretch=1)
 
+        # Standard Library visibility filter
+        lbl_stl = QtWidgets.QLabel("Filter:")
+        lbl_stl.setStyleSheet("color: #94a3b8; font-weight: 600; font-size: 12px;")
+        search_bar.addWidget(lbl_stl)
+        self.cmb_stl_filter = QtWidgets.QComboBox()
+        self.cmb_stl_filter.addItems([
+            "Direct Standard Calls (Recommended)",
+            "User Functions Only",
+            "Show All (Including Internals)",
+        ])
+        self.cmb_stl_filter.setFixedHeight(36)
+        self.cmb_stl_filter.setToolTip("Control display of standard library algorithms vs internal implementation details")
+        self.cmb_stl_filter.currentIndexChanged.connect(self._on_stl_filter_changed)
+        search_bar.addWidget(self.cmb_stl_filter)
+
+        # View mode: Flat ranking vs Hierarchical call tree
+        lbl_view = QtWidgets.QLabel("View:")
+        lbl_view.setStyleSheet("color: #94a3b8; font-weight: 600; font-size: 12px;")
+        search_bar.addWidget(lbl_view)
+        self.cmb_func_view_mode = QtWidgets.QComboBox()
+        self.cmb_func_view_mode.addItems([
+            "☰ Flat Ranking",
+            "🌲 Hierarchical Call Tree",
+        ])
+        self.cmb_func_view_mode.setFixedHeight(36)
+        self.cmb_func_view_mode.setToolTip("Switch between flat sorted function ranking and hierarchical caller-callee call tree")
+        self.cmb_func_view_mode.currentIndexChanged.connect(self._on_func_view_mode_changed)
+        search_bar.addWidget(self.cmb_func_view_mode)
+
         self.lbl_func_count = QtWidgets.QLabel("0 functions recorded")
         self.lbl_func_count.setStyleSheet("color: #94a3b8; font-size: 13px;")
         search_bar.addWidget(self.lbl_func_count)
         layout.addLayout(search_bar)
 
-        # Splitter: Table on left, Details on right
+        # Splitter: Left pane (Table or Tree), Right pane (Details & Syscalls)
         splitter = QtWidgets.QSplitter(Qt.Horizontal)
 
-        # Functions Table
+        # Stacked widget to host Flat Table vs Hierarchical Tree
+        self.stack_functions = QtWidgets.QStackedWidget()
+
+        # 1. Functions Table (Flat Ranking)
         self.tbl_functions = QtWidgets.QTableWidget()
-        self.tbl_functions.setColumnCount(8)
+        self.tbl_functions.setColumnCount(9)
         self.tbl_functions.setHorizontalHeaderLabels(
             [
                 "Function Name",
+                "Category",
                 "Calls",
                 "Total Time",
                 "% Total",
                 "Self Time",
                 "% Self",
                 "Avg / Call",
-                "Syscalls",
+                "Containment",
             ]
         )
         self.tbl_functions.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.Stretch
         )
-        for col in range(1, 8):
+        for col in range(1, 9):
             self.tbl_functions.horizontalHeader().setSectionResizeMode(
                 col, QtWidgets.QHeaderView.ResizeToContents
             )
@@ -752,8 +803,40 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
             self._on_function_double_clicked
         )
         self.tbl_functions.setSortingEnabled(True)
-        self.tbl_functions.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)  # Bug 9
-        splitter.addWidget(self.tbl_functions)
+        self.tbl_functions.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.stack_functions.addWidget(self.tbl_functions)
+
+        # 2. Functions Tree (Hierarchical Call Tree)
+        self.tree_functions = QtWidgets.QTreeWidget()
+        self.tree_functions.setColumnCount(8)
+        self.tree_functions.setHeaderLabels(
+            [
+                "Function Call Hierarchy",
+                "Category / Containment",
+                "Calls",
+                "Total Time",
+                "% Parent / Root",
+                "Self Time",
+                "% Self",
+                "Avg / Call",
+            ]
+        )
+        self.tree_functions.header().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.Stretch
+        )
+        for col in range(1, 8):
+            self.tree_functions.header().setSectionResizeMode(
+                col, QtWidgets.QHeaderView.ResizeToContents
+            )
+        self.tree_functions.itemSelectionChanged.connect(
+            self._on_tree_function_selected
+        )
+        self.tree_functions.itemDoubleClicked.connect(
+            self._on_tree_function_double_clicked
+        )
+        self.stack_functions.addWidget(self.tree_functions)
+
+        splitter.addWidget(self.stack_functions)
 
         # Right pane: Details & Syscall Attribution Sub-Tabs
         right_tabs = QtWidgets.QTabWidget()
@@ -843,7 +926,7 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
 
         self.cmb_flame_color = QtWidgets.QComboBox()
         self.cmb_flame_color.addItems(
-            ["Self-Time Heat", "Function Hash", "Call Depth"]
+            ["Self-Time Heat", "Category (User vs STL)", "Function Hash", "Call Depth"]
         )
         self.cmb_flame_color.currentIndexChanged.connect(
             self._on_flame_color_changed
@@ -1299,8 +1382,9 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
         # 2. Populate Comparison Table
         self._populate_comparison_table(report)
 
-        # 3. Populate Functions Table
+        # 3. Populate Functions Table & Hierarchical Tree
         self._populate_functions_table(functions, root_total_ns)
+        self._populate_functions_tree(tree, root_total_ns)
 
         # 4. Populate Flame Graph
         sc_map = syscalls.get("by_function", {})
@@ -1417,53 +1501,162 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
             self.tbl_comparison.setItem(row, 3, QtWidgets.QTableWidgetItem(diff_str))
             self.tbl_comparison.setItem(row, 4, QtWidgets.QTableWidgetItem(speedup_str))
 
+    def _get_active_stl_filter_mode(self) -> str:
+        idx = self.cmb_stl_filter.currentIndex()
+        if idx == 1:
+            return "user_only"
+        elif idx == 2:
+            return "show_all"
+        return "direct_std"
+
+    def _should_include_function(self, fn: Dict[str, Any], filter_mode: str) -> bool:
+        cat = fn.get("category", "user")
+        if filter_mode == "user_only":
+            return cat == "user"
+        elif filter_mode == "direct_std":
+            return cat in ("user", "std_direct")
+        return True
+
     def _populate_functions_table(self, functions: List[Dict[str, Any]], root_total_ns: int = 0):
         self.tbl_functions.setSortingEnabled(False)
-        self.tbl_functions.setRowCount(len(functions))
-        
+
+        filter_mode = self._get_active_stl_filter_mode()
+        filtered_funcs = [
+            fn for fn in functions if self._should_include_function(fn, filter_mode)
+        ]
+
+        self.tbl_functions.setRowCount(len(filtered_funcs))
+
         # Ensure non-zero denominator for percentage calculations
         if root_total_ns <= 0:
             root_total_ns = max(1, sum(item.get("self_ns", 0) for item in functions))
 
-        self.lbl_func_count.setText(f"{len(functions)} functions recorded")
+        self.lbl_func_count.setText(f"{len(filtered_funcs)} of {len(functions)} functions shown")
 
         sorted_funcs = sorted(
-            functions, key=lambda item: item.get("self_ns", 0), reverse=True
+            filtered_funcs, key=lambda item: item.get("self_ns", 0), reverse=True
         )
         for row, fn in enumerate(sorted_funcs):
             name = fn.get("name", "unknown")
+            cat = fn.get("category", "user")
             calls = fn.get("calls", 1)
             tot_ns = fn.get("total_ns", 0)
             self_ns = fn.get("self_ns", 0)
             avg_ns = (tot_ns / calls) if calls > 0 else 0
-            sc = fn.get("syscalls", {})
-            sc_count = sum(sc.values()) if sc else 0
+            containment = fn.get("containment", {})
 
-            # Percentage relative to root execution time, clamped to 100.0%
+            cat_label = {
+                "user": "User",
+                "std_direct": "Direct std",
+                "std_internal": "Internal std",
+                "runtime": "Harness",
+            }.get(cat, cat)
+
+            if containment.get("is_strictly_contained"):
+                containment_text = f"100% in {containment.get('sole_caller')}"
+            elif containment.get("callers_list"):
+                callers_list = containment.get("callers_list", [])
+                containment_text = f"Shared ({len(callers_list)} callers)"
+            else:
+                containment_text = "Root / Entry"
+
             pct_tot = min(100.0, (tot_ns / root_total_ns) * 100.0)
             pct_self = min(100.0, (self_ns / root_total_ns) * 100.0)
 
             it_name = QtWidgets.QTableWidgetItem(name)
             it_name.setData(Qt.UserRole, fn)
+            it_cat = QtWidgets.QTableWidgetItem(cat_label)
             it_calls = NumericTableWidgetItem(f"{calls:,}", calls)
             it_tot = NumericTableWidgetItem(format_duration(tot_ns), tot_ns)
             it_pct_tot = NumericTableWidgetItem(f"{pct_tot:.1f}%", pct_tot)
             it_self = NumericTableWidgetItem(format_duration(self_ns), self_ns)
             it_pct_self = NumericTableWidgetItem(f"{pct_self:.1f}%", pct_self)
             it_avg = NumericTableWidgetItem(format_duration(avg_ns), avg_ns)
-            it_sc = NumericTableWidgetItem(f"{sc_count}" if sc_count > 0 else "—", sc_count)
+            it_contain = QtWidgets.QTableWidgetItem(containment_text)
 
             self.tbl_functions.setItem(row, 0, it_name)
-            self.tbl_functions.setItem(row, 1, it_calls)
-            self.tbl_functions.setItem(row, 2, it_tot)
-            self.tbl_functions.setItem(row, 3, it_pct_tot)
-            self.tbl_functions.setItem(row, 4, it_self)
-            self.tbl_functions.setItem(row, 5, it_pct_self)
-            self.tbl_functions.setItem(row, 6, it_avg)
-            self.tbl_functions.setItem(row, 7, it_sc)
+            self.tbl_functions.setItem(row, 1, it_cat)
+            self.tbl_functions.setItem(row, 2, it_calls)
+            self.tbl_functions.setItem(row, 3, it_tot)
+            self.tbl_functions.setItem(row, 4, it_pct_tot)
+            self.tbl_functions.setItem(row, 5, it_self)
+            self.tbl_functions.setItem(row, 6, it_pct_self)
+            self.tbl_functions.setItem(row, 7, it_avg)
+            self.tbl_functions.setItem(row, 8, it_contain)
 
         self.tbl_functions.setSortingEnabled(True)
         self.tbl_functions.horizontalScrollBar().setValue(0)
+
+    def _populate_functions_tree(self, tree_nodes: List[Dict[str, Any]], root_total_ns: int = 0):
+        self.tree_functions.setSortingEnabled(False)
+        self.tree_functions.clear()
+
+        if not tree_nodes:
+            return
+
+        filter_mode = self._get_active_stl_filter_mode()
+        node_map = {n["id"]: n for n in tree_nodes}
+
+        tree_items: Dict[int, NumericTreeWidgetItem] = {}
+        for node in tree_nodes:
+            nid = node.get("id", 0)
+            if nid == 0:
+                continue
+
+            if not self._should_include_function(node, filter_mode):
+                continue
+
+            name = node.get("name", "unknown")
+            cat = node.get("category", "user")
+            calls = node.get("calls", 1)
+            tot_ns = node.get("total_ns", 0)
+            self_ns = node.get("self_ns", 0)
+            avg_ns = (tot_ns / calls) if calls > 0 else 0
+
+            cat_tag = {
+                "user": "[user]",
+                "std_direct": "[std]",
+                "std_internal": "[std::internal]",
+                "runtime": "[harness]",
+            }.get(cat, f"[{cat}]")
+
+            pid = node.get("parent", 0)
+            parent_node = node_map.get(pid)
+            parent_dur = parent_node.get("total_ns", 0) if parent_node and pid != 0 else root_total_ns
+            pct_parent = min(100.0, (tot_ns / max(1, parent_dur)) * 100.0)
+            pct_self = min(100.0, (self_ns / max(1, tot_ns)) * 100.0)
+
+            item = NumericTreeWidgetItem([
+                name,
+                cat_tag,
+                f"{calls:,}",
+                format_duration(tot_ns),
+                f"{pct_parent:.1f}%",
+                format_duration(self_ns),
+                f"{pct_self:.1f}%",
+                format_duration(avg_ns),
+            ])
+            item.setData(0, Qt.UserRole, node)
+            item.setData(2, Qt.UserRole, calls)
+            item.setData(3, Qt.UserRole, tot_ns)
+            item.setData(4, Qt.UserRole, pct_parent)
+            item.setData(5, Qt.UserRole, self_ns)
+            item.setData(6, Qt.UserRole, pct_self)
+            item.setData(7, Qt.UserRole, avg_ns)
+
+            tree_items[nid] = item
+
+        for nid, item in tree_items.items():
+            node = node_map.get(nid)
+            pid = node.get("parent", 0) if node else 0
+            if pid in tree_items and pid != nid:
+                tree_items[pid].addChild(item)
+            else:
+                self.tree_functions.addTopLevelItem(item)
+
+        self.tree_functions.setSortingEnabled(True)
+        self.tree_functions.sortByColumn(3, Qt.DescendingOrder)
+        self.tree_functions.expandToDepth(1)
 
     def _filter_functions_table(self, query: str):
         query = query.strip().lower()
@@ -1480,7 +1673,37 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
         if query:
             self.lbl_func_count.setText(f"Showing {visible} of {total} functions")
         else:
-            self.lbl_func_count.setText(f"{total} functions recorded")
+            self.lbl_func_count.setText(f"{total} functions shown")
+
+        # Also filter tree widget items
+        def _filter_tree_item(item: QtWidgets.QTreeWidgetItem) -> bool:
+            name = item.text(0).lower()
+            match = query in name
+            child_match = False
+            for i in range(item.childCount()):
+                child_match |= _filter_tree_item(item.child(i))
+            vis = match or child_match
+            item.setHidden(not vis)
+            if match:
+                item.setExpanded(True)
+            return vis
+
+        for i in range(self.tree_functions.topLevelItemCount()):
+            _filter_tree_item(self.tree_functions.topLevelItem(i))
+
+    def _on_stl_filter_changed(self):
+        if not self.current_report:
+            return
+        profile = self.current_report.get("profile", {})
+        functions = profile.get("functions", [])
+        tree = profile.get("tree", [])
+        root_total_ns = profile.get("total_duration_ns", 0)
+        self._populate_functions_table(functions, root_total_ns)
+        self._populate_functions_tree(tree, root_total_ns)
+        self._filter_functions_table(self.txt_func_search.text())
+
+    def _on_func_view_mode_changed(self, idx: int):
+        self.stack_functions.setCurrentIndex(idx)
 
     def _on_function_selected(self):
         items = self.tbl_functions.selectedItems()
@@ -1493,7 +1716,31 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
         fn_data = item.data(Qt.UserRole)
         if not fn_data:
             return
+        self._display_function_details(fn_data)
 
+    def _on_tree_function_selected(self):
+        items = self.tree_functions.selectedItems()
+        if not items:
+            return
+        item = items[0]
+        fn_data = item.data(0, Qt.UserRole)
+        if not fn_data:
+            return
+        self._display_function_details(fn_data)
+
+    def _on_tree_function_double_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int):
+        fn_data = item.data(0, Qt.UserRole)
+        if not fn_data:
+            return
+        fn_name = fn_data.get("name", "")
+        self.tabs.setCurrentIndex(2)
+        node = self.flame_widget.find_node_by_name(fn_name)
+        if node:
+            self.flame_widget.selected_node = node
+            self.flame_widget.zoom_to_node(node)
+            self._on_flame_zoom_changed(node)
+
+    def _display_function_details(self, fn_data: Dict[str, Any]):
         self.lbl_detail_title.setText(fn_data.get("name", "Function Details"))
         sc = fn_data.get("syscalls", {})
         sc_html = (
@@ -1507,15 +1754,55 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
         }
         prefix = "Estimated " if estimated else ""
 
+        category = fn_data.get("category", "user")
+        cat_badge = {
+            "user": "<span style='background: #065f46; color: #34d399; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px;'>USER CODE</span>",
+            "std_direct": "<span style='background: #1e3a8a; color: #60a5fa; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px;'>DIRECT STD CALL</span>",
+            "std_internal": "<span style='background: #374151; color: #9ca3af; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px;'>INTERNAL STD</span>",
+            "runtime": "<span style='background: #831843; color: #f472b6; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px;'>RUNTIME HARNESS</span>",
+        }.get(category, "")
+
+        containment = fn_data.get("containment", {})
+        if not containment and self.current_report:
+            containment = self.current_report.get("profile", {}).get("containment", {}).get(fn_data.get("name", ""), {})
+
+        callers_list = containment.get("callers_list", [])
+        callees_list = containment.get("callees_list", [])
+
+        if containment.get("is_strictly_contained"):
+            sole = containment.get("sole_caller")
+            containment_box = f"<div style='background: #064e3b; border: 1px solid #059669; padding: 8px 12px; border-radius: 6px; margin: 10px 0; color: #a7f3d0;'>⚡ <b>100% Strictly Contained</b> within <code>{sole}</code></div>"
+        elif callers_list:
+            n_callers = len(callers_list)
+            containment_box = f"<div style='background: #1e293b; border: 1px solid #334155; padding: 8px 12px; border-radius: 6px; margin: 10px 0; color: #cbd5e1;'>🔀 <b>Shared Function:</b> Called across {n_callers} caller(s)</div>"
+        else:
+            containment_box = "<div style='background: #1e293b; border: 1px solid #334155; padding: 8px 12px; border-radius: 6px; margin: 10px 0; color: #94a3b8;'>Top-Level / Root Entrypoint</div>"
+
+        if callers_list:
+            c_items = "".join(f"<li><b>{c['name']}</b>: {c['pct_of_callee']:.1f}% of time ({format_duration(c['total_ns'])}, {c['calls']:,} calls)</li>" for c in callers_list[:8])
+            callers_section = f"<b>Callers (Where this is called from):</b><ul style='margin-top: 4px; margin-bottom: 8px; padding-left: 20px;'>{c_items}</ul>"
+        else:
+            callers_section = "<b>Callers:</b> None (Root entrypoint)<br><br>"
+
+        if callees_list:
+            ce_items = "".join(f"<li><b>{ce['name']}</b>: {ce['pct_of_parent']:.1f}% of parent ({format_duration(ce['total_ns'])}, {ce['calls']:,} calls)</li>" for ce in callees_list[:8])
+            callees_section = f"<b>Callees (Functions executed within this):</b><ul style='margin-top: 4px; margin-bottom: 8px; padding-left: 20px;'>{ce_items}</ul>"
+        else:
+            callees_section = "<b>Callees:</b> None (Leaf function)<br><br>"
+
         html = f"""
+        <div style='margin-bottom: 8px;'>{cat_badge}</div>
         <b>Address:</b> <span style="font-family: monospace;">{fn_data.get('address', 'N/A')}</span><br>
         <b>Call Count:</b> {fn_data.get('calls', 1):,}<br>
         <b>{prefix}Inclusive Time:</b> {format_duration(fn_data.get('total_ns', 0))}<br>
         <b>{prefix}Exclusive Self Time:</b> {format_duration(fn_data.get('self_ns', 0))}<br>
         <b>{prefix}Min Call Duration:</b> {format_duration(fn_data.get('min_ns', 0))}<br>
-        <b>{prefix}Max Call Duration:</b> {format_duration(fn_data.get('max_ns', 0))}<br><br>
+        <b>{prefix}Max Call Duration:</b> {format_duration(fn_data.get('max_ns', 0))}<br>
+        {containment_box}
+        {callers_section}
+        {callees_section}
         <b>Attributed System Calls:</b>
-        <ul>{sc_html}</ul>
+        <ul style='margin-top: 4px; padding-left: 20px;'>{sc_html}</ul>
         """
         self.txt_detail_body.setHtml(html)
 
@@ -1572,8 +1859,9 @@ class BenchmarkStudioWindow(QtWidgets.QMainWindow):
         self.flame_widget.set_top_down(idx == 0)
 
     def _on_flame_color_changed(self, idx: int):
-        modes = ["heat", "hash", "depth"]
-        self.flame_widget.set_color_mode(modes[idx])
+        modes = ["heat", "category", "hash", "depth"]
+        if idx < len(modes):
+            self.flame_widget.set_color_mode(modes[idx])
 
     def _on_flame_node_clicked_from_widget(self, node_info: dict):
         crumbs = self.flame_widget.get_node_path(self.flame_widget.selected_node)

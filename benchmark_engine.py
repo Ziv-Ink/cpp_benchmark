@@ -66,6 +66,13 @@ def normalize_profile_durations(profile: Dict[str, Any], measured_ns: int | floa
     profiled_ns = max(
         (fn.get("total_ns", 0) for fn in functions), default=0
     )
+    if profile.get("tree"):
+        t_roots = [n for n in profile["tree"] if n.get("parent") in (-1, 0) and n.get("id") != 0]
+        if t_roots:
+            profiled_ns = max(profiled_ns, sum(n.get("total_ns", 0) for n in t_roots))
+        elif profile["tree"]:
+            profiled_ns = max(profiled_ns, profile["tree"][0].get("total_ns", 0))
+
     if profiled_ns <= 0 or measured_ns <= 0:
         return False
 
@@ -98,10 +105,53 @@ def clean_cpp_name(name: str) -> str:
     # Simplify common STL types
     name = re.sub(r'std::basic_string<char,\s*std::char_traits<char>,\s*std::allocator<char>\s*>', 'std::string', name)
     name = re.sub(r'std::basic_string_view<char,\s*std::char_traits<char>\s*>', 'std::string_view', name)
-    # Remove default allocators and deleters
+    # Remove default allocators, deleters, and comparators
     name = re.sub(r',\s*std::allocator<[^>]+>\s*', '', name)
     name = re.sub(r',\s*std::default_delete<[^>]+>\s*', '', name)
+    name = re.sub(r',\s*std::less<[^>]+>\s*', '', name)
+    name = re.sub(r',\s*std::equal_to<[^>]+>\s*', '', name)
+    name = re.sub(r',\s*std::hash<[^>]+>\s*', '', name)
     return name.strip()
+
+
+def is_std_symbol(name: str) -> bool:
+    """Checks whether a demangled symbol belongs to the standard library or compiler support."""
+    if not name:
+        return False
+    return bool(re.search(r'\b(?:std|__gnu_cxx|__detail|__cxxabiv1)\b', name))
+
+
+def is_runtime_harness(name: str) -> bool:
+    """Checks whether a symbol is part of the benchmark profiling harness itself."""
+    if not name:
+        return False
+    return (
+        "bench_profile" in name
+        or "bench::MainTimer" in name
+        or name.startswith("__cyg_profile")
+        or "main_bench_scope_timer" in name
+    )
+
+
+def classify_symbol(name: str, parent_category: str = "user") -> str:
+    """Classifies a symbol into: 'user', 'std_direct', 'std_internal', or 'runtime'.
+
+    - 'user': Application code written by the developer.
+    - 'std_direct': Standard library function called directly from user code (e.g. std::sort, std::vector::push_back).
+    - 'std_internal': Implementation details called from within standard functions (e.g. __introsort_loop, __split_buffer).
+    - 'runtime': Benchmark runner / profiler harness routines.
+    """
+    if is_runtime_harness(name):
+        return "runtime"
+    if not is_std_symbol(name):
+        if name.startswith("__") and not name.startswith("__gnu_cxx"):
+            return "std_internal" if parent_category in ("std_direct", "std_internal") else "user"
+        return "user"
+
+    # Standard library symbol
+    if parent_category == "user":
+        return "std_direct"
+    return "std_internal"
 
 
 @dataclasses.dataclass
@@ -653,25 +703,6 @@ endif()
                         node["name"] = resolved
                 node["name"] = clean_cpp_name(node.get("name", ""))
 
-            # Filter out standard library and internal noise from the functions table
-            def is_noise(name: str) -> bool:
-                if not name: return True
-                if name.startswith("__"): return True
-                # Strip trailing argument list
-                func_qual = re.sub(r'\([^\(\)]*\)\s*(?:const|noexcept|\&|\&\&)?\s*$', '', name).strip()
-                # Strip template arguments
-                cleaned = re.sub(r'<[^>]*>', '', func_qual)
-                if re.search(r'\b(?:std|__gnu_cxx|bench|__format|__formatter)\b', cleaned):
-                    return True
-                if 'bench_profile' in name:
-                    return True
-                return False
-
-            profile_data["functions"] = [
-                fn for fn in profile_data.get("functions", [])
-                if not is_noise(fn.get("name", ""))
-            ]
-
             # Merge ABI-duplicate constructor/destructor entries.
             # The Itanium C++ ABI emits two physical symbols per ctor/dtor:
             #   C1 (complete object ctor) and C2 (base object ctor) — same demangled name.
@@ -706,7 +737,6 @@ endif()
             # Merge ABI-duplicate sibling nodes in the call tree (same parent, same name).
             # Group tree nodes by (parent_id, name); keep the one with the largest total_ns.
             if profile_data.get("tree"):
-                # Build a map: (parent, name) → best node id so far
                 best: dict = {}  # (parent, name) → node dict
                 keep_ids: set = set()
                 remap: dict = {}  # dropped_id → surviving_id
@@ -732,10 +762,130 @@ endif()
                         node["parent"] = remap[p]
                 profile_data["tree"] = surviving
 
-            # Optional: Collapse noise nodes in the tree to clean up the flame graph a bit
-            for node in profile_data.get("tree", []):
-                if is_noise(node.get("name", "")):
-                    node["name"] = "[STL Internal]"
+            # Build tree node map for top-down traversal and classification
+            tree_nodes = profile_data.get("tree", [])
+            node_map: Dict[int, Dict[str, Any]] = {n["id"]: n for n in tree_nodes}
+
+            # Top-down tree category tagging
+            visited_nodes: set = set()
+            def _tag_node_category(node_id: int, parent_cat: str):
+                if node_id in visited_nodes:
+                    return
+                visited_nodes.add(node_id)
+                n = node_map.get(node_id)
+                if not n:
+                    return
+                if node_id == 0:
+                    n["category"] = "runtime"
+                    child_pcat = "user"
+                else:
+                    cat = classify_symbol(n.get("name", ""), parent_cat)
+                    n["category"] = cat
+                    child_pcat = cat
+                for cid in n.get("children", []):
+                    _tag_node_category(cid, child_pcat)
+
+            if 0 in node_map:
+                _tag_node_category(0, "user")
+            for nid in list(node_map.keys()):
+                if nid not in visited_nodes:
+                    _tag_node_category(nid, "user")
+
+            # Map function names to best category seen across call sites
+            name_to_cats: Dict[str, set] = collections.defaultdict(set)
+            for n in tree_nodes:
+                name_to_cats[n.get("name", "")].add(n.get("category", "user"))
+
+            for fn in profile_data.get("functions", []):
+                fname = fn.get("name", "")
+                cats = name_to_cats.get(fname, set())
+                if "user" in cats:
+                    fn["category"] = "user"
+                elif "std_direct" in cats:
+                    fn["category"] = "std_direct"
+                elif "std_internal" in cats:
+                    fn["category"] = "std_internal"
+                elif "runtime" in cats:
+                    fn["category"] = "runtime"
+                else:
+                    fn["category"] = classify_symbol(fname, "user")
+
+            # Compute containment and caller/callee aggregation
+            containment: Dict[str, Any] = {}
+            for n in tree_nodes:
+                nid = n.get("id", 0)
+                if nid == 0:
+                    continue
+                name = n.get("name", "")
+                pid = n.get("parent", 0)
+                parent_node = node_map.get(pid)
+                parent_name = parent_node.get("name", "Root / Entry") if parent_node and pid != 0 else "Root / Entry"
+                parent_dur = parent_node.get("total_ns", 0) if parent_node else n.get("total_ns", 0)
+
+                if name not in containment:
+                    containment[name] = {
+                        "total_ns": 0,
+                        "calls": 0,
+                        "callers": {},
+                        "callees": {},
+                    }
+                c_entry = containment[name]
+                c_entry["total_ns"] += n.get("total_ns", 0)
+                c_entry["calls"] += n.get("calls", 0)
+
+                if parent_name not in c_entry["callers"]:
+                    c_entry["callers"][parent_name] = {"calls": 0, "total_ns": 0, "parent_total_ns": parent_dur}
+                c_entry["callers"][parent_name]["calls"] += n.get("calls", 0)
+                c_entry["callers"][parent_name]["total_ns"] += n.get("total_ns", 0)
+
+                # Record callee in parent's callees
+                if parent_name != "Root / Entry":
+                    if parent_name not in containment:
+                        containment[parent_name] = {"total_ns": 0, "calls": 0, "callers": {}, "callees": {}}
+                    p_entry = containment[parent_name]
+                    if name not in p_entry["callees"]:
+                        p_entry["callees"][name] = {"calls": 0, "total_ns": 0}
+                    p_entry["callees"][name]["calls"] += n.get("calls", 0)
+                    p_entry["callees"][name]["total_ns"] += n.get("total_ns", 0)
+
+            # Format callers and callees into sorted lists with percentages
+            for name, entry in containment.items():
+                tot = max(1, entry["total_ns"])
+                callers_list = []
+                for cname, cdata in entry["callers"].items():
+                    callers_list.append({
+                        "name": cname,
+                        "calls": cdata["calls"],
+                        "total_ns": cdata["total_ns"],
+                        "pct_of_callee": min(100.0, (cdata["total_ns"] / tot) * 100.0),
+                        "pct_of_caller": min(100.0, (cdata["total_ns"] / max(1, cdata["parent_total_ns"])) * 100.0) if cdata["parent_total_ns"] else 0.0,
+                    })
+                callers_list.sort(key=lambda x: x["total_ns"], reverse=True)
+                entry["callers_list"] = callers_list
+
+                callees_list = []
+                for cname, cdata in entry["callees"].items():
+                    callees_list.append({
+                        "name": cname,
+                        "calls": cdata["calls"],
+                        "total_ns": cdata["total_ns"],
+                        "pct_of_parent": min(100.0, (cdata["total_ns"] / tot) * 100.0),
+                    })
+                callees_list.sort(key=lambda x: x["total_ns"], reverse=True)
+                entry["callees_list"] = callees_list
+
+                non_root_callers = [c for c in callers_list if c["name"] != "Root / Entry"]
+                if len(non_root_callers) == 1 and non_root_callers[0]["pct_of_callee"] >= 99.0:
+                    entry["is_strictly_contained"] = True
+                    entry["sole_caller"] = non_root_callers[0]["name"]
+                else:
+                    entry["is_strictly_contained"] = False
+                    entry["sole_caller"] = None
+
+            profile_data["containment"] = containment
+            for fn in profile_data.get("functions", []):
+                fn["containment"] = containment.get(fn.get("name", ""), {})
+
 
             # Syscall tracing
             syscall_data: Dict[str, Any] = {

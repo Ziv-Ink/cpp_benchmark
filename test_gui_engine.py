@@ -11,6 +11,9 @@ from benchmark_engine import (
     BenchmarkConfig,
     SymbolResolver,
     normalize_profile_durations,
+    classify_symbol,
+    is_std_symbol,
+    is_runtime_harness,
 )
 from flamegraph_widget import FlameGraphWidget, FlameNode, format_duration
 from syscall_tracer import SyscallTracer
@@ -197,6 +200,119 @@ close(3) = 0
         speedup = max(m1, m2) / min(m1, m2)
         self.assertEqual(fastest, "b")
         self.assertAlmostEqual(speedup, 10.0)
+
+    def test_symbol_classification(self):
+        self.assertEqual(classify_symbol("my_custom_task()", "user"), "user")
+        self.assertEqual(classify_symbol("std::sort<int*>", "user"), "std_direct")
+        self.assertEqual(classify_symbol("std::vector<int>::push_back(int const&)", "user"), "std_direct")
+        self.assertEqual(classify_symbol("std::__1::__introsort_loop", "std_direct"), "std_internal")
+        self.assertEqual(classify_symbol("std::__split_buffer<int>::push_back", "std_internal"), "std_internal")
+        self.assertEqual(classify_symbol("bench_profile_finish", "user"), "runtime")
+        self.assertEqual(classify_symbol("bench::MainTimer::~MainTimer", "user"), "runtime")
+
+    def test_stl_filter_modes_and_containment_inspector(self):
+        from PyQt5.QtWidgets import QApplication
+        from dashboard_gui import BenchmarkStudioWindow
+
+        app = QApplication.instance() or QApplication(["test", "-platform", "offscreen"])
+        window = BenchmarkStudioWindow(
+            str(Path(__file__).parent / "fixtures" / "sample_project")
+        )
+
+        test_report = {
+            "target": "demo_target",
+            "summary": {"median_ns": 50_000_000},
+            "profile": {
+                "total_duration_ns": 50_000_000,
+                "timing_basis": "normalized_profile_estimate",
+                "functions": [
+                    {
+                        "name": "user_worker()",
+                        "category": "user",
+                        "calls": 1,
+                        "total_ns": 50_000_000,
+                        "self_ns": 10_000_000,
+                        "containment": {
+                            "is_strictly_contained": False,
+                            "sole_caller": None,
+                            "callers_list": [{"name": "Root / Entry", "calls": 1, "total_ns": 50_000_000, "pct_of_callee": 100.0}],
+                            "callees_list": [
+                                {"name": "std::sort()", "calls": 1, "total_ns": 30_000_000, "pct_of_parent": 60.0},
+                                {"name": "busy_helper()", "calls": 1, "total_ns": 10_000_000, "pct_of_parent": 20.0},
+                            ],
+                        }
+                    },
+                    {
+                        "name": "std::sort()",
+                        "category": "std_direct",
+                        "calls": 1,
+                        "total_ns": 30_000_000,
+                        "self_ns": 5_000_000,
+                        "containment": {
+                            "is_strictly_contained": True,
+                            "sole_caller": "user_worker()",
+                            "callers_list": [{"name": "user_worker()", "calls": 1, "total_ns": 30_000_000, "pct_of_callee": 100.0}],
+                            "callees_list": [{"name": "std::__introsort_loop()", "calls": 1, "total_ns": 25_000_000, "pct_of_parent": 83.3}],
+                        }
+                    },
+                    {
+                        "name": "std::__introsort_loop()",
+                        "category": "std_internal",
+                        "calls": 1,
+                        "total_ns": 25_000_000,
+                        "self_ns": 25_000_000,
+                        "containment": {
+                            "is_strictly_contained": True,
+                            "sole_caller": "std::sort()",
+                            "callers_list": [{"name": "std::sort()", "calls": 1, "total_ns": 25_000_000, "pct_of_callee": 100.0}],
+                            "callees_list": [],
+                        }
+                    },
+                ],
+                "tree": [
+                    {"id": 0, "parent": 0, "name": "root", "total_ns": 50_000_000, "self_ns": 0, "calls": 1, "category": "runtime"},
+                    {"id": 1, "parent": 0, "name": "user_worker()", "total_ns": 50_000_000, "self_ns": 10_000_000, "calls": 1, "category": "user"},
+                    {"id": 2, "parent": 1, "name": "std::sort()", "total_ns": 30_000_000, "self_ns": 5_000_000, "calls": 1, "category": "std_direct"},
+                    {"id": 3, "parent": 2, "name": "std::__introsort_loop()", "total_ns": 25_000_000, "self_ns": 25_000_000, "calls": 1, "category": "std_internal"},
+                ],
+            },
+            "syscalls": {},
+        }
+
+        window.current_report = test_report
+        window._populate_functions_table(test_report["profile"]["functions"], 50_000_000)
+        window._populate_functions_tree(test_report["profile"]["tree"], 50_000_000)
+
+        # Mode 0: "Direct Standard Calls" -> user_worker + std::sort (2 items)
+        window.cmb_stl_filter.setCurrentIndex(0)
+        self.assertEqual(window.tbl_functions.rowCount(), 2)
+
+        # Mode 1: "User Functions Only" -> user_worker only (1 item)
+        window.cmb_stl_filter.setCurrentIndex(1)
+        self.assertEqual(window.tbl_functions.rowCount(), 1)
+        self.assertEqual(window.tbl_functions.item(0, 0).text(), "user_worker()")
+
+        # Mode 2: "Show All (Including Internals)" -> all 3 items
+        window.cmb_stl_filter.setCurrentIndex(2)
+        self.assertEqual(window.tbl_functions.rowCount(), 3)
+
+        # Test containment details display for std::sort (index 1)
+        fn_sort = test_report["profile"]["functions"][1]
+        window._display_function_details(fn_sort)
+        html_details = window.txt_detail_body.toHtml()
+        self.assertIn("100% Strictly Contained", html_details)
+        self.assertIn("user_worker()", html_details)
+        self.assertIn("DIRECT STD CALL", html_details)
+
+        # Test Tree Widget Hierarchy
+        self.assertEqual(window.tree_functions.topLevelItemCount(), 1)
+        root_item = window.tree_functions.topLevelItem(0)
+        self.assertEqual(root_item.text(0), "user_worker()")
+        self.assertEqual(root_item.childCount(), 1)
+        child_sort = root_item.child(0)
+        self.assertEqual(child_sort.text(0), "std::sort()")
+
+        window.close()
 
 
 if __name__ == "__main__":

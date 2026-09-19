@@ -38,6 +38,7 @@ class FlameNode:
         calls: int = 1,
         syscalls: Optional[Dict[str, int]] = None,
         address: str = "",
+        category: str = "user",
     ):
         self.id = node_id
         self.name = name
@@ -46,6 +47,7 @@ class FlameNode:
         self.calls = calls
         self.syscalls = syscalls or {}
         self.address = address
+        self.category = category
         self.children: List[FlameNode] = []
         self.parent: Optional[FlameNode] = None
         self.depth: int = 0
@@ -105,8 +107,9 @@ class FlameGraphWidget(QtWidgets.QWidget):
             calls = item.get("calls", 1)
             addr = item.get("address", "")
             sc = syscall_map.get(name, {})
+            cat = item.get("category", "user")
             nodes[nid] = FlameNode(
-                nid, name, total, self_ns, calls, sc, address=addr
+                nid, name, total, self_ns, calls, sc, address=addr, category=cat
             )
 
         # Link parent/child relationships
@@ -348,6 +351,20 @@ class FlameGraphWidget(QtWidgets.QWidget):
         if node.id == 0:
             return QtGui.QColor("#374151")
 
+        if self.color_mode == "category":
+            if node.category == "std_direct":
+                return QtGui.QColor("#2563eb")
+            elif node.category == "std_internal":
+                return QtGui.QColor("#475569")
+            elif node.category == "runtime":
+                return QtGui.QColor("#9d174d")
+            else:
+                ratio = (node.self_ns / node.total_ns) if node.total_ns > 0 else 0.0
+                r = int(210 + 45 * ratio)
+                g = int(90 + 60 * (1.0 - ratio))
+                b = int(40 + 30 * (1.0 - ratio))
+                return QtGui.QColor(min(255, r), min(255, g), min(255, b))
+
         if self.color_mode == "heat":
             # Intensity based on self-time percentage relative to total
             ratio = (
@@ -455,9 +472,16 @@ class FlameGraphWidget(QtWidgets.QWidget):
             )
             sc_html = f"<b>Syscalls:</b> {sc_items}<br>"
 
+        cat_badge = {
+            "user": "<span style='background: #065f46; color: #34d399; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600;'>USER CODE</span>",
+            "std_direct": "<span style='background: #1e3a8a; color: #60a5fa; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600;'>DIRECT STD</span>",
+            "std_internal": "<span style='background: #374151; color: #9ca3af; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600;'>INTERNAL STD</span>",
+            "runtime": "<span style='background: #831843; color: #f472b6; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600;'>RUNTIME</span>",
+        }.get(node.category, "")
+
         text = f"""
         <div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; font-size: 13px; color: #f3f4f6; background-color: #1f242d; padding: 8px; border: 1px solid #374151; border-radius: 6px;">
-          <b style="font-size: 14px; color: #60a5fa;">{node.name}</b><br>
+          <b style="font-size: 14px; color: #60a5fa;">{node.name}</b> {cat_badge}<br>
           <b>Inclusive:</b> {format_duration(node.total_ns)} ({total_pct:.1f}% total, {parent_pct:.1f}% parent)<br>
           <b>Self:</b> {format_duration(node.self_ns)} ({self_pct:.1f}% self)<br>
           <b>Calls:</b> {node.calls:,} (avg {format_duration(avg_ns)})<br>

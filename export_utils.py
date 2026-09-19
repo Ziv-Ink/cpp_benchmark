@@ -49,6 +49,7 @@ def export_csv(data: Dict[str, Any], filepath: Path | str) -> Path:
     fieldnames = [
         "Rank",
         "Function",
+        "Category",
         "Calls",
         "Total Time (ns)",
         "Self Time (ns)",
@@ -57,6 +58,7 @@ def export_csv(data: Dict[str, Any], filepath: Path | str) -> Path:
         "Avg Time (ns)",
         "Min Time (ns)",
         "Max Time (ns)",
+        "Containment",
         "Syscall Count",
         "Syscalls Breakdown",
     ]
@@ -73,14 +75,23 @@ def export_csv(data: Dict[str, Any], filepath: Path | str) -> Path:
             tot = fn.get("total_ns", 0)
             self_ns = fn.get("self_ns", 0)
             calls = fn.get("calls", 1)
+            cat = fn.get("category", "user")
             sc = fn.get("syscalls", {})
             sc_count = sum(sc.values())
             sc_detail = "; ".join(f"{k}:{v}" for k, v in sc.items())
+            containment = fn.get("containment", {})
+            if containment.get("is_strictly_contained"):
+                contain_str = f"100% in {containment.get('sole_caller')}"
+            elif containment.get("callers_list"):
+                contain_str = f"Shared ({len(containment['callers_list'])} callers)"
+            else:
+                contain_str = "Root / Entry"
 
             writer.writerow(
                 {
                     "Rank": rank,
                     "Function": fn.get("name", "unknown"),
+                    "Category": cat,
                     "Calls": calls,
                     "Total Time (ns)": tot,
                     "Self Time (ns)": self_ns,
@@ -91,6 +102,7 @@ def export_csv(data: Dict[str, Any], filepath: Path | str) -> Path:
                     ),
                     "Min Time (ns)": fn.get("min_ns", 0),
                     "Max Time (ns)": fn.get("max_ns", 0),
+                    "Containment": contain_str,
                     "Syscall Count": sc_count,
                     "Syscalls Breakdown": sc_detail,
                 }
@@ -236,10 +248,12 @@ def export_html_report(data: Dict[str, Any], filepath: Path | str) -> Path:
       <thead>
         <tr>
           <th>Function</th>
+          <th>Category</th>
           <th>Calls</th>
           <th>Total Time</th>
           <th>Self Time</th>
           <th>% Self</th>
+          <th>Containment</th>
           <th>Syscalls</th>
         </tr>
       </thead>
@@ -255,6 +269,7 @@ def export_html_report(data: Dict[str, Any], filepath: Path | str) -> Path:
         functions, key=lambda item: item.get("self_ns", 0), reverse=True
     ):
         name = fn.get("name", "unknown")
+        cat = fn.get("category", "user")
         calls = fn.get("calls", 1)
         tot = format_duration(fn.get("total_ns", 0))
         self_ns = fn.get("self_ns", 0)
@@ -262,10 +277,25 @@ def export_html_report(data: Dict[str, Any], filepath: Path | str) -> Path:
         pct = (self_ns / tot_dur) * 100.0
         sc = fn.get("syscalls", {})
         sc_str = ", ".join(f"{k}:{v}" for k, v in sc.items()) if sc else "—"
+        containment = fn.get("containment", {})
+        if containment.get("is_strictly_contained"):
+            contain_str = f"100% in {containment.get('sole_caller')}"
+        elif containment.get("callers_list"):
+            contain_str = f"Shared ({len(containment['callers_list'])})"
+        else:
+            contain_str = "Root / Entry"
+
+        cat_badge = {
+            "user": "<span style='background: #065f46; color: #34d399; padding: 2px 6px; border-radius: 4px; font-size: 11px;'>user</span>",
+            "std_direct": "<span style='background: #1e3a8a; color: #60a5fa; padding: 2px 6px; border-radius: 4px; font-size: 11px;'>std</span>",
+            "std_internal": "<span style='background: #374151; color: #9ca3af; padding: 2px 6px; border-radius: 4px; font-size: 11px;'>internal</span>",
+            "runtime": "<span style='background: #831843; color: #f472b6; padding: 2px 6px; border-radius: 4px; font-size: 11px;'>harness</span>",
+        }.get(cat, cat)
 
         html_content += f"""
         <tr>
           <td style="font-family: monospace; color: #60a5fa;">{name}</td>
+          <td>{cat_badge}</td>
           <td>{calls:,}</td>
           <td>{tot}</td>
           <td><b>{self_str}</b></td>
@@ -273,6 +303,7 @@ def export_html_report(data: Dict[str, Any], filepath: Path | str) -> Path:
             <div class="bar-container"><div class="bar-fill" style="width: {min(100, pct):.1f}%;"></div></div>
             {pct:.1f}%
           </td>
+          <td><span style="font-size: 12px; color: #94a3b8;">{contain_str}</span></td>
           <td>{sc_str}</td>
         </tr>"""
 
